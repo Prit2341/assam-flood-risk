@@ -212,21 +212,18 @@ def get_daycomp(
 
     if in_test and not pred_df.empty:
         for h in hours:
-            obs_dt  = datetime.combine(target_date, __import__('datetime').time(h, 0))
-            pred_dt = datetime.combine(target_date, __import__('datetime').time(h, 0)) - timedelta(hours=lead)
+            obs_dt = datetime.combine(target_date, __import__('datetime').time(h, 0))
+            # For lead h+N, the prediction was issued N hours earlier
+            issue_dt_h = obs_dt - timedelta(hours=lead)
 
-            obs_row = pred_df[pred_df["datetime"] == obs_dt]
+            obs_row  = pred_df[pred_df["datetime"] == obs_dt]
             obs = round(float(obs_row.iloc[0]["tp_mm"]), 3) if not obs_row.empty else None
 
-            pred_row = pred_df[pred_df["datetime"] == datetime.combine(target_date - timedelta(hours=lead) // 24, __import__('datetime').time((h - lead) % 24, 0))]
-            # Simpler: shift the actual signal by lead with bias
-            if obs is not None:
-                bf  = [1.0, 0.94, 0.88, 0.82, 0.76, 0.70][lead - 1]
-                nf  = [0.10,0.18,0.26,0.34,0.42,0.50][lead - 1]
-                s3  = _seed(date_str + district + "pred" + str(h))
-                noise = ((s3 % 200) / 100 - 1) * nf * obs
-                pred = max(0.0, round(obs * bf + noise, 3))
-                q90  = max(pred, round(pred + obs * 0.25 * (lead / 2), 3))
+            # Use real model prediction issued `lead` hours before obs_dt
+            pred_row = pred_df[pred_df["datetime"] == obs_dt]
+            if not pred_row.empty:
+                pred = round(float(pred_row.iloc[0]["q50_final"]), 3)
+                q90  = round(float(pred_row.iloc[0]["q90_final"]), 3) if "q90_final" in pred_row.columns else round(float(pred_row.iloc[0]["q90_ens"]), 3)
             else:
                 pred = None
                 q90  = None
