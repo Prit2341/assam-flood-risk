@@ -25,6 +25,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+from susceptibility import router as susc_router, rain_router
+app.include_router(susc_router)
+app.include_router(rain_router)
+
 # ── District metadata ─────────────────────────────────────────────────────────
 DISTRICTS = {
     "nagaon":    {"label": "Nagaon",    "lat": 26.3456, "lon": 92.6835, "elev_m": 58,  "river": "Kopili"},
@@ -57,30 +61,27 @@ def load_perf(district: str) -> pd.DataFrame:
 
 
 def load_pred(district: str) -> pd.DataFrame:
+    """Real out-of-sample predictions only (test period >= 2024), one row per (lead, target time).
+    Lead 1 = rainfall v1 (base + CNN stacked) from scripts/120; leads 2-6 = base model from
+    scripts/30 (stacked per-row predictions were not stored for leads > 1). Row 'datetime' in the
+    horizons file is target - (lead-1) h (scripts/30: tp_mm.shift(-(h-1)))."""
     if district not in _pred_cache:
-        p = DATA / f"base_rainfall_{district}_predictions.csv"
-        if not p.exists():
-            return pd.DataFrame()
-        df = pd.read_csv(p, parse_dates=["datetime"])
-        _pred_cache[district] = df
+        frames = []
+        hz = DATA / f"forecast_horizons_{district}.csv"
+        if hz.exists():
+            h = pd.read_csv(hz, parse_dates=["datetime"])
+            h = h[h["lead_hour"] > 1]
+            h["target_dt"] = h["datetime"] + pd.to_timedelta(h["lead_hour"] - 1, unit="h")
+            h["model"] = "base model"
+            frames.append(h.rename(columns={"lead_hour": "lead"})[["lead", "target_dt", "tp_mm", "q10_ens", "q50_final", "q90_ens", "model"]])
+        v1 = DATA / f"v1_rolling1h_{district}_hourly.csv"
+        if v1.exists():
+            a = pd.read_csv(v1, parse_dates=["datetime"]).rename(columns={"datetime": "target_dt"})
+            a["lead"] = 1
+            a["model"] = "v1 (base + CNN)"
+            frames.append(a[["lead", "target_dt", "tp_mm", "q10_ens", "q50_final", "q90_ens", "model"]])
+        _pred_cache[district] = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     return _pred_cache[district]
-
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
-def _seed(s: str) -> int:
-    h = 0
-    for c in s:
-        h = (h * 31 + ord(c)) & 0xFFFFFFFF
-    return h
-
-
-def _jitter(base: float, rng: float, seed: int) -> float:
-    frac = ((seed * 9301 + 49297) % 233280) / 233280
-    return max(0.0, round(base + (frac - 0.5) * rng, 3))
-
-
-DIURNAL = [0.10,0.08,0.07,0.06,0.08,0.14, 0.22,0.30,0.35,0.42,0.55,0.70,
-           0.85,0.95,1.0,0.90,0.80,0.75, 0.65,0.55,0.45,0.32,0.22,0.14]
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
@@ -143,24 +144,16 @@ def get_forecast(
         ph = perf[perf["lead"] == lead].iloc[0]
         rmse = float(ph["rmse_all"])
 
-        # Use real predictions if available (test period)
+        # Real out-of-sample predictions only; no value is shown for dates without one.
         q50 = q10 = q90 = None
-        if in_test and not pred_df.empty:
-            row = pred_df[pred_df["datetime"] == target_dt]
+        model = None
+        if not pred_df.empty:
+            row = pred_df[(pred_df["lead"] == lead) & (pred_df["target_dt"] == target_dt)]
             if not row.empty:
                 q50 = round(float(row.iloc[0]["q50_final"]), 3)
                 q10 = round(float(row.iloc[0]["q10_ens"]),   3)
                 q90 = round(float(row.iloc[0]["q90_ens"]),   3)
-
-        # Fall back to seeded synthetic
-        if q50 is None:
-            s = _seed(f"{date_str}{district}{lead}")
-            base_q50 = [3.2, 2.8, 2.1, 4.6, 5.1, 4.3][lead - 1]
-            scale = 1.0 + (_seed(date_str + district) % 200) / 200 - 0.5
-            q50 = _jitter(base_q50 * scale, base_q50 * 0.8, s)
-            q10 = _jitter(q50 * 0.25, q50 * 0.2, s ^ 0xABCD)
-            q90 = _jitter(q50 * 2.0,  q50 * 0.5, s ^ 0x1234)
-            q10, q90 = min(q10, q50 * 0.9), max(q90, q50 * 1.1)
+                model = row.iloc[0]["model"]
 
         horizons.append({
             "lead":     lead,
@@ -169,7 +162,8 @@ def get_forecast(
             "q10":      q10,
             "q50":      q50,
             "q90":      q90,
-            "is_real":  (q50 is not None and in_test),
+            "is_real":  q50 is not None,
+            "model":    model,
         })
 
     # Event label
@@ -210,43 +204,20 @@ def get_daycomp(
     pred_vals:   list[Optional[float]] = []
     q90_vals:    list[Optional[float]] = []
 
-    if in_test and not pred_df.empty:
+    if not pred_df.empty:
+        sub = pred_df[(pred_df["lead"] == lead) & (pred_df["target_dt"].dt.date == target_date)].set_index("target_dt")
         for h in hours:
             obs_dt = datetime.combine(target_date, __import__('datetime').time(h, 0))
-            # For lead h+N, the prediction was issued N hours earlier
-            issue_dt_h = obs_dt - timedelta(hours=lead)
-
-            obs_row  = pred_df[pred_df["datetime"] == obs_dt]
-            obs = round(float(obs_row.iloc[0]["tp_mm"]), 3) if not obs_row.empty else None
-
-            # Use real model prediction issued `lead` hours before obs_dt
-            pred_row = pred_df[pred_df["datetime"] == obs_dt]
-            if not pred_row.empty:
-                pred = round(float(pred_row.iloc[0]["q50_final"]), 3)
-                q90  = round(float(pred_row.iloc[0]["q90_final"]), 3) if "q90_final" in pred_row.columns else round(float(pred_row.iloc[0]["q90_ens"]), 3)
+            if obs_dt in sub.index:
+                r = sub.loc[obs_dt]
+                actual_vals.append(round(float(r["tp_mm"]), 3))
+                pred_vals.append(round(float(r["q50_final"]), 3))
+                q90_vals.append(round(float(r["q90_ens"]), 3))
             else:
-                pred = None
-                q90  = None
-
-            actual_vals.append(obs)
-            pred_vals.append(pred)
-            q90_vals.append(q90)
+                actual_vals.append(None); pred_vals.append(None); q90_vals.append(None)
     else:
-        # Synthetic diurnal pattern
-        s    = _seed(date_str + district)
-        inten = 1.0 + (((s * 1664525 + 1013904223) & 0xFFFFFFFF) / 0xFFFFFFFF - 0.3) * 3.0
-        bf   = [1.0, 0.94, 0.88, 0.82, 0.76, 0.70][lead - 1]
-        nf   = [0.10,0.18,0.26,0.34,0.42,0.50][lead - 1]
-        for i, d_val in enumerate(DIURNAL):
-            s2   = _seed(date_str + district + str(i))
-            obs  = max(0.0, round(d_val * inten * (0.8 + (s2 % 100) / 100 * 0.4), 3))
-            s3   = _seed(date_str + district + "pred" + str(i))
-            noise = ((s3 % 200) / 100 - 1) * nf * obs
-            pred = max(0.0, round(obs * bf + noise, 3))
-            q90  = max(pred, round(pred + obs * 0.25 * (lead / 2), 3))
-            actual_vals.append(obs)
-            pred_vals.append(pred)
-            q90_vals.append(q90)
+        actual_vals = pred_vals = q90_vals = [None] * 24
+    # Training-period dates (< 2024) have no out-of-sample prediction: all values stay None.
 
     # Compute stats
     pairs = [(a, p) for a, p in zip(actual_vals, pred_vals) if a is not None and p is not None]
@@ -273,6 +244,8 @@ def get_daycomp(
         "hits":        hits,
         "misses":      misses,
         "false_alarms": false_alm,
+        "available":   any(v is not None for v in pred_vals),
+        "model":       "v1 (base + CNN)" if lead == 1 else "base model",
     }
 
 
