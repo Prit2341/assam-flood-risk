@@ -2,7 +2,7 @@
 
 Phase 3 of a flood-risk digital-twin thesis. Phase 1 (methodology) was Sri Lanka; Phase 2 (transferability) was Arunachal Pradesh. This project applies the same pipeline to Assam, India.
 
-**Status**: Rainfall nowcasting model built and validated for all 4 districts. Hydraulic/inundation modeling not yet started.
+**Status (2026-10-20)**: Rainfall model v1 frozen (`releases/rainfall_v1/`). Dynamic flood susceptibility built and validated for all 4 districts; the working model is **H6** (see below) and it drives the dashboard. Hydraulic/inundation modelling (HEC-RAS), bathymetry and the one-basin scope question are still open.
 
 ---
 
@@ -62,6 +62,7 @@ data/
   soilgrids/           SoilGrids rasters per district (full depth profile)
   hysplit_trajectories/ HYSPLIT backward-trajectory outputs and plots
   nrsc_inundation_pdfs/ NRSC official flood maps (PDF, not GIS format)
+  dynamic_susceptibility/ Susceptibility table, GFM labels, static/met features, models, eval_*.csv, diag/
   water_level_scope4.csv  CWC live gauge snapshot (2026-09-14 only, not historical)
 
 scripts/
@@ -90,6 +91,12 @@ scripts/
   60_assembler_nagaon.py    4-member assembler (not adopted)
   80_heavy_detector_nagaon.py  Standalone heavy-event detector (not adopted)
   rainfall_nowcast_pilot.py    v0 pilot (XGBoost surface-only, superseded)
+
+  # Dynamic flood susceptibility (see section below)
+  170_dynamic_susceptibility.py ... 180_h6_dashboard.py
+
+dashboard-app/    React + FastAPI dashboard (see dashboard-app/README.md)
+docs/             dynamic_susceptibility_method.md (method + all amendments), literature review
 
 kb_chroma/
   db/             ChromaDB vector store (detailed findings, numbers, debugging trails)
@@ -122,6 +129,34 @@ Architecture (adapted from the Seychelles Phase 1 ensemble):
 - The pressure-grid CNN physics term (moisture-flux convergence loss) is inert at current scale — call it "pressure-grid CNN," not PINN, in any writeup.
 - Regional GPD (the 3rd leg of the Seychelles ensemble) is not implemented — needs a regional surface-TP spatial grid, not yet pulled.
 - SLSQP blend (4th leg) was tried via the assembler and did not help.
+
+---
+
+## Dynamic Flood Susceptibility — Current State
+
+Per-date flood probability for every 90 m cell, trained on Sentinel-1 flood maps (Copernicus GFM, 2016-2026, 1,676 usable scenes). Method, every amendment and its pre-registered criteria are in `docs/dynamic_susceptibility_method.md`; each amendment was written down before it was run.
+
+| Model | Inputs | Use |
+|---|---|---|
+| AHP (A2) | Literature AHP weights (Choudhury & Dutta 2026) + 5-day rain | Baseline, no training |
+| H2 | Terrain, rain, soil moisture, GloFAS Q/Q90 | Districts with no flood-map history |
+| H5 (Amendment 4) | H2 + each cell's flood history | Superseded by H6 |
+| **H6 (Amendment 6)** | H5 + what the most recent earlier Sentinel-1 scene (up to 30 days back) showed at each cell | **Working model for the 4 districts** |
+
+Held-out results (leave-one-year-out, pooled per district):
+- AUC: H2 0.87-0.92, H5 0.90-0.94, H6 0.94-0.97.
+- Scenes where the predicted flooded area is off by more than 2x: H5 54-66%, H6 32-45% (past-only forward check 36-44%). Over- and under-estimation both drop.
+- F1 with held-out thresholds: H5 0.28-0.42, H6 0.43-0.60.
+
+Known limits (not glossed over):
+- H6 needs a GFM scene from the last 30 days; the gain comes from scenes up to 12 days old.
+- "Same as the last scene" alone is as good as H6 on flooded area in Sivasagar.
+- Large sudden floods that follow a dry scene are still under-predicted.
+- GFM is both input and target. An L-band (PALSAR-2) check found GFM partly missed water on low-lying cropland on about 4 of 9 worst over-prediction dates.
+- For a district the model never saw, the F1 threshold did not transfer (Amendment 5). Choosing it on held-out districts and dropping absolute elevation fixes most of that, but adoption is still a pending decision.
+- F1/CSI figures from scripts 170-173 used in-sample thresholds and are likely understated; AUC is unaffected.
+
+Scripts: `170_dynamic_susceptibility.py` (table, P1-P6), `171`-`175` (Amendments 2-4, H5 dashboard), `174_lodo_threshold.py` (Amendment 5), `176_heavy_rain_results.py`, `177_extent_error_diag.py`, `178_independent_sensor_check.py` (PALSAR-2 / Sentinel-2 check), `179_amendment6.py` (H6), `180_h6_dashboard.py`. Outputs in `data/dynamic_susceptibility/` (`eval_*.csv`, `diag/`).
 
 ---
 
