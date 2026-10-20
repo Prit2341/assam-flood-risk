@@ -14,7 +14,10 @@ A 90 m cell is usable only if >=50% of its 20 m pixels are valid (not GFM nodata
 not reference_water_mask) and it is inside the district and not DEM-flattened water. Flooded if >=50%
 of its valid pixels are flood. Tiles of the same date are mosaicked (a district can span 2 Equi7 tiles).
 
-Run: python -u scripts/130_pull_gfm_timeseries.py <District>|all
+Run: python -u scripts/130_pull_gfm_timeseries.py <District>|all [first_year last_year]
+     With a year range, progress goes to labels_index_<first>-<last>.csv so several processes can run
+     on different years of one district at once; merge with: python scripts/130_pull_gfm_timeseries.py merge <District>
+     GFM_THREADS env var sets parallel scene reads per process (default 6).
 Out: data/dynamic_susceptibility/labels/<District>/<YYYY-MM-DD>.npz, labels_index.csv
 """
 import os
@@ -95,20 +98,37 @@ def scene_label(items, tr, shape, usable_grid):
     return lab
 
 
-def run(d):
+def merge(d):
+    import glob
+    out_dir = os.path.join(dc.DYN, "labels", d)
+    main = os.path.join(out_dir, "labels_index.csv")
+    parts = sorted(glob.glob(os.path.join(out_dir, "labels_index_*-*.csv")))
+    m = pd.concat([pd.read_csv(f) for f in [main] + parts if os.path.exists(f)])
+    m.drop_duplicates("date").sort_values("date").to_csv(main, index=False)
+    for f in parts:
+        os.remove(f)
+    print(f"{d}: merged {len(parts)} part files -> {len(m.drop_duplicates('date'))} dates", flush=True)
+
+
+def run(d, years=YEARS, part=None):
     tr, shape, inside, bad = dc.grid(d)
     usable = inside & ~bad
     out_dir = os.path.join(dc.DYN, "labels", d)
     os.makedirs(out_dir, exist_ok=True)
-    idx_path = os.path.join(out_dir, "labels_index.csv")
-    done = set(pd.read_csv(idx_path)["date"]) if os.path.exists(idx_path) else set()
+    main_idx = os.path.join(out_dir, "labels_index.csv")
+    idx_path = os.path.join(out_dir, f"labels_index_{part}.csv") if part else main_idx
+    done = set()
+    for f in {main_idx, idx_path}:
+        if os.path.exists(f):
+            done |= set(pd.read_csv(f)["date"])
     poly = dc.district_polygon(d)
     bbox = list(poly.bounds)
     print(f"{d}: grid {shape}, usable cells {usable.sum():,}", flush=True)
-    np.savez_compressed(os.path.join(out_dir, "_grid.npz"), usable=usable, inside=inside, dem_water=bad,
-                        transform=np.array(tr)[:6])
+    if not os.path.exists(os.path.join(out_dir, "_grid.npz")):
+        np.savez_compressed(os.path.join(out_dir, "_grid.npz"), usable=usable, inside=inside, dem_water=bad,
+                            transform=np.array(tr)[:6])
     rows = []
-    for y in YEARS:
+    for y in years:
         for mth in MONTHS:
             feats = search(bbox, y, mth)
             if not feats:
@@ -135,7 +155,7 @@ def run(d):
                 return {"date": day, "n_tiles": len(by_date[day]), "obs_frac": n_obs / usable.sum(),
                         "flood_frac_obs": float((lab == 1).sum() / n_obs)}
 
-            with ThreadPoolExecutor(6) as ex:
+            with ThreadPoolExecutor(int(os.environ.get("GFM_THREADS", 6))) as ex:
                 res = [r for r in ex.map(work, todo) if r]
             for r in res:
                 print(f"  {r['date']} obs={r['obs_frac']:.2f} flood={r['flood_frac_obs']:.4f}", flush=True)
@@ -149,5 +169,11 @@ def run(d):
 
 if __name__ == "__main__":
     a = sys.argv[1] if len(sys.argv) > 1 else "all"
-    for d in (dc.DISTRICTS if a == "all" else [a]):
-        run(d)
+    if a == "merge":
+        merge(sys.argv[2])
+    elif len(sys.argv) == 4:
+        y0, y1 = int(sys.argv[2]), int(sys.argv[3])
+        run(a, range(y0, y1 + 1), part=f"{y0}-{y1}")
+    else:
+        for d in (dc.DISTRICTS if a == "all" else [a]):
+            run(d)

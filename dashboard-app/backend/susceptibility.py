@@ -176,6 +176,19 @@ def layer_png(district: str, name: str, date: str = Query(default=None)):
         lab[lab == 255] = np.nan
         return Response(_png(lab, None, 0, 1, categorical={0: (148, 163, 184, 90), 1: (220, 38, 38, 230)}),
                         media_type="image/png")
+    if name == "ml_h2_rel":
+        # percentile rank of each cell within this date: shows WHERE is most prone on any date, not how much floods
+        a = _h2_map(d, date)
+        v = ~np.isnan(a)
+        r = np.full(a.shape, np.nan)
+        r[v] = (np.argsort(np.argsort(a[v])) + 0.5) / v.sum()
+        return Response(_png(r, "YlOrRd", 0, 1), media_type="image/png")
+    if name == "ml_h2":
+        a = _h2_map(d, date)
+        # one fixed LOG scale for every date, 0.01% .. 50%: probabilities span ~4 orders of magnitude (dry-day median
+        # ~1e-4, flood-day median ~0.12), so a linear scale painted every dry-day cell the same pale colour
+        lg = np.log10(np.clip(a, 1e-4, 0.5))
+        return Response(_png(lg, "YlOrRd", -4, np.log10(0.5)), media_type="image/png")
     if name == "ahp_dynamic":
         a, _ = _ahp_map(d, date)
         return Response(_png(a, "YlOrRd", 1, 5), media_type="image/png")
@@ -245,6 +258,56 @@ def _ahp_map(d, date):
                    "amc_class": {1: "I (dry)", 3: "II (normal)", 5: "III (wet)"}[int(np.nanmedian(dyn.amc_rank(r5[valid])))]}
 
 
+H2_DIR = DYN / "models_h2_loyo"
+GLOFAS_H2 = {**dyn.GLOFAS, "Karimganj": ("karimganj_kushiyara", "karimganj_barak")}   # Amendment 2, check K
+
+
+@lru_cache(maxsize=4)
+def _glofas(tag):
+    return dyn.glofas_features(tag)
+
+
+@lru_cache(maxsize=16)
+def _h2_model(year: int):
+    from xgboost import XGBClassifier
+    f = H2_DIR / f"h2_without_{year}.json"
+    if not f.exists():
+        return None
+    m = XGBClassifier()
+    m.load_model(str(f))
+    return m
+
+
+@lru_cache(maxsize=8)
+def _h2_map(d, date):
+    """Dynamic ML (H2) flood probability for every cell on this date, from the model trained WITHOUT this
+    date's year (scripts/171 models), so past dates are mapped out-of-sample."""
+    t = pd.Timestamp(date)
+    mdl = _h2_model(t.year)
+    if mdl is None:
+        raise HTTPException(404, f"no held-out-year H2 model for {t.year}")
+    S, usable, tr = _static(d)
+    valid = usable & np.all([~np.isnan(S[k]) for k in dyn.STATIC_RAW], axis=0)
+    met = _met(d)
+    pts, near = _near(d)
+    cols = list(next(iter(met.values())).columns)
+    mf = np.stack([met[tuple(p)].reindex([t]).iloc[0].values for p in pts])
+    ii = np.flatnonzero(valid.ravel())
+    X = pd.DataFrame({k: S[k].ravel()[ii] for k in dyn.STATIC_RAW})
+    for c_i, c in enumerate(cols):
+        X[c] = mf[near[ii], c_i]
+    if X["r5"].isna().all():
+        raise HTTPException(404, "no rainfall data for this date")
+    for name, tag in zip(("q_trib", "q_main"), GLOFAS_H2[d]):
+        g = _glofas(tag) if tag else None
+        ok = g is not None and t in g.index
+        X[name] = g.loc[t, "q"] if ok else np.nan
+        X[f"{name}_max7"] = g.loc[t, "qmax7"] if ok else np.nan
+    p = np.full(valid.size, np.nan)
+    p[ii] = mdl.predict_proba(X[json.load(open(H2_DIR / "meta.json"))["features"]])[:, 1]
+    return p.reshape(valid.shape)
+
+
 @router.get("/map/{district}")
 def map_meta(district: str, date: str):
     """Bounds + which overlays exist for this district/date, plus the AHP summary for that date."""
@@ -257,6 +320,7 @@ def map_meta(district: str, date: str):
            "ahp_class_pct": {n: round(float((cls == i).mean() * 100), 1)
                              for i, n in enumerate(["very low", "low", "moderate", "high", "very high"])},
            "observed_available": (DYN / "labels" / d / f"{date}.npz").exists(),
+           "h2_available": (H2_DIR / f"h2_without_{pd.Timestamp(date).year}.json").exists(),
            "ml_maps": sorted(p.stem.split("_")[-1] for p in (DYN / "maps").glob(f"{d}_{date}_*.tif")) if (DYN / "maps").exists() else []}
     if out["observed_available"]:
         lab = np.load(DYN / "labels" / d / f"{date}.npz")["label"]
@@ -267,4 +331,11 @@ def map_meta(district: str, date: str):
         if 0 < y.mean() < 1:
             from sklearn.metrics import roc_auc_score
             out["ahp_auc_this_scene"] = round(float(roc_auc_score(y, sc)), 3)
+            try:
+                h2 = _h2_map(d, date)
+                ok = o & ~np.isnan(h2)
+                out["h2_auc_this_scene"] = round(float(roc_auc_score(lab[ok], h2[ok])), 3)
+                out["h2_mean_prob_pct"] = round(float(np.nanmean(h2[ok]) * 100), 2)
+            except HTTPException:
+                pass
     return out

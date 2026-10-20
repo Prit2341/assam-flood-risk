@@ -28,14 +28,16 @@ POINTS = [  # tag, lat, lon, box half-width
     ("sivasagar_dikhow", 26.92, 94.73, 0.15), ("karimganj_kushiyara", 24.87, 92.35, 0.15),
     ("morigaon_brahmaputra", 26.40, 92.30, 0.20), ("nagaon_brahmaputra", 26.62, 92.85, 0.20),
     ("sivasagar_brahmaputra", 27.00, 94.40, 0.20),
+    # Amendment 2 (2026-10-14): Karimganj had no main-stem input (q_main 100% NaN). Barak main stem upstream
+    # of the Surma/Kushiyara split (Badarpur-Silchar reach); the box excludes the Kushiyara gauge cell.
+    ("karimganj_barak", 24.85, 92.65, 0.20),
 ]
-c = cdsapi.Client()
 
 
 def req(lat, lon, half, years, ptype, target):
     if os.path.exists(target):
         return target
-    c.retrieve("cems-glofas-historical", {
+    cdsapi.Client().retrieve("cems-glofas-historical", {
         "system_version": ["version_4_0"], "hydrological_model": ["lisflood"], "product_type": [ptype],
         "timespan": ["time_mean"], "variable": ["average_river_discharge_in_the_last_24_hours"],
         "year": [str(y) for y in years], "month": [f"{m:02d}" for m in range(1, 13)],
@@ -60,6 +62,25 @@ def series(files):
     return s, float(mm.latitude[i]), float(mm.longitude[j])
 
 
+def year_file(tag, lat, lon, half, y):
+    """Fetch one point-year (consolidated, falling back to intermediate for recent years)."""
+    for ptype in (("consolidated", "intermediate") if y == 2025 else (("intermediate",) if y == 2026 else ("consolidated",))):
+        try:
+            return req(lat, lon, half, [y], ptype, f"{OUT}/{tag}_{y}_{ptype[:4]}.grib")
+        except Exception as e:
+            print(tag, y, ptype, "failed:", str(e)[:150], flush=True)
+
+
+# Submit missing point-years 3 at a time: EWDS rejects more ("Number queued requests for this dataset is
+# temporarily limited", 2026-10-12); each request spends ~3-7 min queued and seconds downloading.
+from concurrent.futures import ThreadPoolExecutor
+jobs = [(tag, lat, lon, half, y) for tag, lat, lon, half in POINTS for y in range(2015, 2027)
+        if not (tag.endswith(("kopili", "dikhow", "kushiyara")) and os.path.exists(f"data/glofas_q90/{tag.split('_')[0]}_{y}.grib"))
+        and not os.path.exists(f"{OUT}/{tag}_{y}_cons.grib") and not os.path.exists(f"{OUT}/{tag}_{y}_inte.grib")]
+print(f"{len(jobs)} point-years to fetch", flush=True)
+with ThreadPoolExecutor(int(os.environ.get("GLOFAS_PARALLEL", 3))) as ex:
+    list(ex.map(lambda j: year_file(*j), jobs))
+
 meta = {}
 for tag, lat, lon, half in POINTS:
     files = []
@@ -70,12 +91,9 @@ for tag, lat, lon, half in POINTS:
             files.append(old)
             continue
         # one year per request: multi-year requests exceed the EWDS cost limit (403, 2026-10-10)
-        for ptype in (("consolidated", "intermediate") if y == 2025 else (("intermediate",) if y == 2026 else ("consolidated",))):
-            try:
-                files.append(req(lat, lon, half, [y], ptype, f"{OUT}/{tag}_{y}_{ptype[:4]}.grib"))
-                break
-            except Exception as e:
-                print(tag, y, ptype, "failed:", str(e)[:150], flush=True)
+        f = year_file(tag, lat, lon, half, y)
+        if f:
+            files.append(f)
     s, clat, clon = series([f for f in files if os.path.exists(f)])
     s.rename("discharge_m3s").rename_axis("date").reset_index().to_csv(f"{OUT}/{tag}.csv", index=False)
     meta[tag] = {"chan_lat": clat, "chan_lon": clon, "first": str(s.index.min().date()),
