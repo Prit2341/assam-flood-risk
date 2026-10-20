@@ -145,7 +145,7 @@ def _png(arr, cmap, vmin, vmax, categorical=None):
             m = ok & (np.round(arr) == k)
             rgba[m] = col
     else:
-        cm = matplotlib.colormaps[cmap]
+        cm = SUSC_CMAP if cmap == "susc" else matplotlib.colormaps[cmap]
         x = np.clip((arr - vmin) / (vmax - vmin + 1e-12), 0, 1)
         rgba[ok] = (np.array(cm(x[ok])) * 255).astype(np.uint8)
         rgba[ok, 3] = 210
@@ -153,6 +153,15 @@ def _png(arr, cmap, vmin, vmax, categorical=None):
     Image.fromarray(rgba, "RGBA").save(b, "PNG")
     return b.getvalue()
 
+
+def _susc_cmap():
+    from matplotlib.colors import LinearSegmentedColormap
+    # light blue (low) -> very pale blue -> pale yellow -> orange -> dark red (high)
+    return LinearSegmentedColormap.from_list("susc", [(0, "#9ecae1"), (0.27, "#deebf7"), (0.54, "#ffffbf"),
+                                                      (0.81, "#fdae61"), (0.9, "#f46d43"), (1, "#a50026")])
+
+
+SUSC_CMAP = _susc_cmap()
 
 DW_COLORS = {0: (65, 155, 223, 220), 1: (57, 125, 73, 220), 2: (136, 176, 83, 220), 3: (122, 135, 198, 220),
              4: (228, 150, 53, 220), 5: (223, 195, 90, 220), 6: (196, 40, 27, 220), 7: (165, 155, 143, 220)}
@@ -176,28 +185,28 @@ def layer_png(district: str, name: str, date: str = Query(default=None)):
         lab[lab == 255] = np.nan
         return Response(_png(lab, None, 0, 1, categorical={0: (148, 163, 184, 90), 1: (220, 38, 38, 230)}),
                         media_type="image/png")
-    if name == "ml_h2_rel":
+    if name in ("ml_h2_rel", "ml_h5_rel", "ml_h6_rel"):
         # percentile rank of each cell within this date: shows WHERE is most prone on any date, not how much floods
-        a = _h2_map(d, date)
+        a = {"ml_h2_rel": _h2_prob, "ml_h5_rel": _h5_map, "ml_h6_rel": _h6_map}[name](d, date)
         v = ~np.isnan(a)
         r = np.full(a.shape, np.nan)
         r[v] = (np.argsort(np.argsort(a[v])) + 0.5) / v.sum()
-        return Response(_png(r, "YlOrRd", 0, 1), media_type="image/png")
-    if name == "ml_h2":
-        a = _h2_map(d, date)
+        return Response(_png(r, "susc", 0, 1), media_type="image/png")
+    if name in ("ml_h2", "ml_h5", "ml_h6"):
+        a = {"ml_h2": _h2_prob, "ml_h5": _h5_map, "ml_h6": _h6_map}[name](d, date)
         # one fixed LOG scale for every date, 0.01% .. 50%: probabilities span ~4 orders of magnitude (dry-day median
         # ~1e-4, flood-day median ~0.12), so a linear scale painted every dry-day cell the same pale colour
         lg = np.log10(np.clip(a, 1e-4, 0.5))
-        return Response(_png(lg, "YlOrRd", -4, np.log10(0.5)), media_type="image/png")
+        return Response(_png(lg, "susc", -4, np.log10(0.5)), media_type="image/png")
     if name == "ahp_dynamic":
         a, _ = _ahp_map(d, date)
-        return Response(_png(a, "YlOrRd", 1, 5), media_type="image/png")
+        return Response(_png(a, "susc", 1, 5), media_type="image/png")
     m = DYN / "maps" / f"{d}_{date}_{name}.tif"
     if m.exists():
         with rasterio.open(m) as s:
             a = s.read(1).astype(float)
             a[a == s.nodata] = np.nan
-        return Response(_png(a, "YlOrRd", 0, np.nanpercentile(a, 99)), media_type="image/png")
+        return Response(_png(a, "susc", 0, np.nanpercentile(a, 99)), media_type="image/png")
     raise HTTPException(404, f"layer {name} not available")
 
 
@@ -305,6 +314,114 @@ def _h2_map(d, date):
         X[f"{name}_max7"] = g.loc[t, "qmax7"] if ok else np.nan
     p = np.full(valid.size, np.nan)
     p[ii] = mdl.predict_proba(X[json.load(open(H2_DIR / "meta.json"))["features"]])[:, 1]
+    return p.reshape(valid.shape), X, ii, valid
+
+
+def _h2_prob(d, date):
+    return _h2_map(d, date)[0]
+
+
+H5_DIR = DYN / "models_h5_loyo"
+H5_HIST = DYN / "h5_history"
+B0_MIN_HIST = 10      # scripts/172 MIN_HIST: pixels with fewer observed training scenes get b0s = NaN
+
+
+@lru_cache(maxsize=16)
+def _h5_model(year: int):
+    from xgboost import XGBClassifier
+    f = H5_DIR / f"h5_without_{year}.json"
+    if not f.exists():
+        return None
+    m = XGBClassifier()
+    m.load_model(str(f))
+    return m
+
+
+def _h5_available(d, year):
+    return (H5_DIR / f"h5_without_{year}.json").exists() and (H5_HIST / f"{d}_{year}.npz").exists()
+
+
+@lru_cache(maxsize=8)
+def _h5_map(d, date):
+    """H5 (Amendment 4 working model): H2 inputs + per-pixel flood history (ff, b0s), model and history both
+    built without this date's year (scripts/175), so past dates are held-out predictions."""
+    t = pd.Timestamp(date)
+    mdl = _h5_model(t.year)
+    if mdl is None or not _h5_available(d, t.year):
+        raise HTTPException(404, f"no held-out-year H5 model/history for {t.year}")
+    _, X, ii, valid = _h2_map(d, date)
+    z = np.load(H5_HIST / f"{d}_{t.year}.npz")
+    thr, drv, nobs = z["thr"].ravel()[ii], z["drv"].ravel()[ii], z["nobs"].ravel()[ii]
+    q = np.where(drv == 1, X["q_main"].values, X["q_trib"].values)
+    inf = np.isinf(thr)
+    b0s = np.where(inf, 0.0, q / np.where(inf, 1, thr))
+    b0s[(nobs < B0_MIN_HIST) | np.isnan(q)] = np.nan
+    X5 = X.assign(ff=z["ff"].ravel()[ii], b0s=b0s)
+    p = np.full(valid.size, np.nan)
+    p[ii] = mdl.predict_proba(X5[json.load(open(H5_DIR / "meta.json"))["features"]])[:, 1]
+    return p.reshape(valid.shape)
+
+
+H6_DIR = DYN / "models_h6_loyo"
+H6_MAXGAP = 30        # scripts/179 MAXGAP
+
+
+@lru_cache(maxsize=16)
+def _h6_model(year: int):
+    from xgboost import XGBClassifier
+    f = H6_DIR / f"h6_without_{year}.json"
+    if not f.exists():
+        return None
+    m = XGBClassifier()
+    m.load_model(str(f))
+    return m
+
+
+def _h6_available(d, year):
+    return (H6_DIR / f"h6_without_{year}.json").exists() and _h5_available(d, year)
+
+
+def _prev_scene(d, date):
+    """Past-only previous-scene features (scripts/179): per pixel the GFM state at the most recent usable scene
+    1-30 days before `date` where it was observed, its age, and the previous scene's district flooded fraction."""
+    t = pd.Timestamp(date)
+    idx = pd.read_csv(DYN / "labels" / d / "labels_index.csv", parse_dates=["date"])
+    idx = idx[(idx["obs_frac"] >= dyn.MIN_OBS_FRAC) & (idx["date"] < t)].sort_values("date")
+    S, usable, tr = _static(d)
+    state = np.full(usable.shape, np.nan, np.float32)
+    gap = np.full(usable.shape, np.nan, np.float32)
+    for _, r in idx[idx["date"] >= t - pd.Timedelta(days=H6_MAXGAP)].iterrows():
+        lab = np.load(DYN / "labels" / d / f"{r['date']:%Y-%m-%d}.npz")["label"]
+        seen = lab != 255
+        state[seen] = lab[seen] == 1
+        gap[seen] = (t - r["date"]).days
+    pf = pfg = np.nan
+    if len(idx):
+        g = (t - idx.iloc[-1]["date"]).days
+        if 1 <= g <= H6_MAXGAP:
+            pf, pfg = float(idx.iloc[-1]["flood_frac_obs"]), float(g)
+    return state, gap, pf, pfg
+
+
+@lru_cache(maxsize=8)
+def _h6_map(d, date):
+    """H6 (Amendment 6 working model): H5 inputs + previous-scene state, held-out-year model (scripts/180)."""
+    t = pd.Timestamp(date)
+    mdl = _h6_model(t.year)
+    if mdl is None or not _h6_available(d, t.year):
+        raise HTTPException(404, f"no held-out-year H6 model/history for {t.year}")
+    _, X, ii, valid = _h2_map(d, date)
+    z = np.load(H5_HIST / f"{d}_{t.year}.npz")
+    thr, drv, nobs = z["thr"].ravel()[ii], z["drv"].ravel()[ii], z["nobs"].ravel()[ii]
+    q = np.where(drv == 1, X["q_main"].values, X["q_trib"].values)
+    inf = np.isinf(thr)
+    b0s = np.where(inf, 0.0, q / np.where(inf, 1, thr))
+    b0s[(nobs < B0_MIN_HIST) | np.isnan(q)] = np.nan
+    state, gap, pf, pfg = _prev_scene(d, date)
+    X6 = X.assign(ff=z["ff"].ravel()[ii], b0s=b0s, prev_wet=state.ravel()[ii], prev_gap=gap.ravel()[ii],
+                  prev_frac=pf, prev_frac_gap=pfg)
+    p = np.full(valid.size, np.nan)
+    p[ii] = mdl.predict_proba(X6[json.load(open(H6_DIR / "meta.json"))["features"]])[:, 1]
     return p.reshape(valid.shape)
 
 
@@ -321,6 +438,8 @@ def map_meta(district: str, date: str):
                              for i, n in enumerate(["very low", "low", "moderate", "high", "very high"])},
            "observed_available": (DYN / "labels" / d / f"{date}.npz").exists(),
            "h2_available": (H2_DIR / f"h2_without_{pd.Timestamp(date).year}.json").exists(),
+           "h5_available": _h5_available(d, pd.Timestamp(date).year),
+           "h6_available": _h6_available(d, pd.Timestamp(date).year),
            "ml_maps": sorted(p.stem.split("_")[-1] for p in (DYN / "maps").glob(f"{d}_{date}_*.tif")) if (DYN / "maps").exists() else []}
     if out["observed_available"]:
         lab = np.load(DYN / "labels" / d / f"{date}.npz")["label"]
@@ -332,10 +451,24 @@ def map_meta(district: str, date: str):
             from sklearn.metrics import roc_auc_score
             out["ahp_auc_this_scene"] = round(float(roc_auc_score(y, sc)), 3)
             try:
-                h2 = _h2_map(d, date)
+                h2 = _h2_prob(d, date)
                 ok = o & ~np.isnan(h2)
                 out["h2_auc_this_scene"] = round(float(roc_auc_score(lab[ok], h2[ok])), 3)
                 out["h2_mean_prob_pct"] = round(float(np.nanmean(h2[ok]) * 100), 2)
+            except HTTPException:
+                pass
+            try:
+                h6 = _h6_map(d, date)
+                ok = o & ~np.isnan(h6)
+                out["h6_auc_this_scene"] = round(float(roc_auc_score(lab[ok], h6[ok])), 3)
+                out["h6_mean_prob_pct"] = round(float(np.nanmean(h6[ok]) * 100), 2)
+            except HTTPException:
+                pass
+            try:
+                h5 = _h5_map(d, date)
+                ok = o & ~np.isnan(h5)
+                out["h5_auc_this_scene"] = round(float(roc_auc_score(lab[ok], h5[ok])), 3)
+                out["h5_mean_prob_pct"] = round(float(np.nanmean(h5[ok]) * 100), 2)
             except HTTPException:
                 pass
     return out
