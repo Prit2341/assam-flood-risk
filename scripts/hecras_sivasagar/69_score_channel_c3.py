@@ -28,10 +28,14 @@ files = dict(control=R/'c600_d4_gridimerg_r30_0705_432h.p01.hdf',
 metadata = {}
 for arm,path in files.items():
     with h5py.File(path) as f:
+        times = score.hdf_times(f)
+        expected = pd.date_range('2026-07-05', '2026-07-23', freq='h')
+        assert times.equals(expected), f'Incomplete or unexpected 432h output in {arm}'
         g = f[GEO]
         real = np.flatnonzero((g['Cells FacePoint Indexes'][:] >= 0).sum(axis=1) >= 3)
         assert np.allclose(g["Cells Center Manning's n"][:][real],.04)
         surfaces = f[f'{TS}/2D Flow Areas/Sivasagar_Domain/Water Surface']
+        assert surfaces.shape[0] == len(expected), f'Incomplete WSE rows in {arm}'
         for i in range(0,surfaces.shape[0],64):
             assert np.isfinite(surfaces[i:i+64,real]).all(), f'Nonfinite real-cell output in {arm}'
         area = g['Cells Surface Area'][:][real].astype(float)
@@ -39,6 +43,11 @@ for arm,path in files.items():
         metadata[arm] = dict(real_cells=len(real),domain_real_cell_area_km2=float(area.sum()/1e6),
             end_effective_rain_Mm3=float(np.sum(rain*area)/1e9),
             mass_error_percent=float(f['Results/Unsteady/Summary/Volume Accounting'].attrs['Error Percent']))
+        computations = f[f'{TS}/2D Flow Areas/Sivasagar_Domain/Computations']
+        statuses = computations['Outer Status'][1:].ravel()
+        metadata[arm]['sampled_iteration_limit_or_divergence_count'] = int(np.sum(statuses < 0))
+        metadata[arm]['saved_postinitial_samples'] = len(statuses)
+        metadata[arm]['numerical_diagnostic_scope'] = 'Hourly snapshots only, not all internal computation steps; diagnostic does not change registered pilot gates.'
 rows = []
 for scene in ['2026-07-17','2026-07-22']:
     tag,when = score.SCENES[scene]

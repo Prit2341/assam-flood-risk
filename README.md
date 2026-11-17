@@ -1,8 +1,37 @@
-# Assam Flood Risk — Phase 3
+# Assam Flood Risk Digital Twin
 
-Phase 3 of a flood-risk digital-twin thesis. Phase 1 (methodology) was Sri Lanka; Phase 2 (transferability) was Arunachal Pradesh. This project applies the same pipeline to Assam, India.
+A flood-risk digital-twin project for Assam, India, combining rainfall modelling, flood susceptibility, HEC-RAS hydraulic simulation and a learned flood surrogate.
 
-**Status (2026-10-20)**: Rainfall model v1 frozen (`releases/rainfall_v1/`). Dynamic flood susceptibility built and validated for all 4 districts; the working model is **H6** (see below) and it drives the dashboard. Hydraulic/inundation modelling (HEC-RAS), bathymetry and the one-basin scope question are still open.
+**Status (2026-11-17)**: The active task is improving the **Sivasagar HEC-RAS teacher against observed floods**. The GNN student baseline is complete; teacher validation remains unresolved. The 100 m channel-mesh experiment was running at the last process check (15:20 IST, 17 November), with no completed accuracy verdict. Rainfall model v1 remains frozen (`releases/rainfall_v1/`), and H6 remains the working dynamic-susceptibility model. The four-district work described below is the earlier project scope; current hydraulic investigation is focused on Sivasagar.
+
+## Current Task — Sivasagar Teacher Improvement
+
+The teacher is HEC-RAS itself. Saved result metadata verifies that it uses the full shallow-water **SWE-ELM** solver. The student learns an approximation of that teacher; copying the teacher and matching real floods are separate validation questions.
+
+| Item | Latest verified position |
+|---|---|
+| Student baseline | Complete. Official student: f1, with flood-extent CSI approximately 0.44 against the teacher; a second seed passed the registered confirmation criterion. This is not accuracy against observed floods. |
+| Teacher against observations | Unresolved; the G1 flood-extent CSI target of 0.30 has not been met on the exploratory multi-scene evaluation. |
+| Ridge-aligned mesh and gauge-rain correction | Tested separately and rejected under their registered pilot criteria. |
+| C3fast: 100 m river-channel mesh | 44,891 real cells; full 432-hour rerun started 17 November through RAS Commander. Last checked running at 15:20 IST; no completed scoring verdict at this update. |
+| Numerical audit | Full equations already active. Some IMERG hourly snapshots hit the iteration limit, but the raw-terrain run still misses the river rise with few such flags. These snapshots are not a census of internal solver steps. |
+| River-rise audit | Across July 15–23, all five checked saved configurations produce smaller maximum 24-hour rises than observed at all four gauges, including the 1 km cell-center sensitivity envelope. A timing shift within that window alone cannot recover the missing rise. |
+| Possible next comparison | Raw terrain with IMERG rainfall: no combined case found among the 26 usable July-checkpoint files in the saved inventory. Assess C3 first; register an isolated test before running this combination. |
+
+**Next action:** finish and score C3fast against the original IMERG control. The registered pilot requires mean July 17/22 CSI gain of at least 0.01, neither scene declining by more than 0.01, at least 10% lower mean absolute river-rise error across four fixed gauge points, finite full-duration output, and mass error below 0.1%. A successful pilot still needs independent-event validation before adoption or student retraining.
+
+**Data constraints:** July CWC stage and rain records were recovered and cross-checked against the primary API. No July discharge was found in the retrieved local-gauge records. Surveyed bathymetry remains unavailable; downloaded model/altimetry-derived rating and bathymetry priors have unresolved location, datum and interpretation issues and have not been applied.
+
+**Run handling:** use RAS Commander, without computer-use/screen monitoring. The 16 November run was stopped incomplete at the user's cutoff; the 17 November run is a new full rerun. Partial HDF output must not be treated as a completed experiment. No deadline for 17 November has been stated.
+
+Current handoff and evidence:
+
+- [TASK.md](TASK.md): current tasks, decisions and chronological progress.
+- [17 November investigation](docs/teacher_diagnostics_2026-11-17.md): solver, rise-timing and saved-input audits; scripts 72–74.
+- [Routing investigation and cutoff handoff](docs/channel_routing_review_2026-11-16.md): C3 design, verified build and previous stop record.
+- [Research and experiment register](docs/teacher_improvement_review_2026-11-16.md): literature, earlier tests and detailed caveats.
+- [C3fast outputs](digital_twin/sivasagar/results/channel_c3fast/): build and logs; completion is recorded by `pipeline_complete.json` and `hydraulic_verdict.json` when available.
+- [KNOWLEDGE_BASE.md](KNOWLEDGE_BASE.md) and ChromaDB: standing decisions and detailed findings. Read [MEMORY.md](MEMORY.md) and [AGENTS.md](AGENTS.md) when starting work.
 
 ---
 
@@ -113,10 +142,10 @@ CLAUDE.md           Mandatory project rules (read this before working on the cod
 
 ## Rainfall Nowcasting Model — Current State
 
-Architecture (adapted from the Seychelles Phase 1 ensemble):
+Rainfall model architecture:
 
 1. **Occurrence classifier** — XGBoost binary (rain/no-rain); lag-1 surface ERA5 features
-2. **Quantile regression** (q10/q50/q90) — XGBoost, same features; adaptive per-district heavy-rain threshold (99.5th percentile of rainy-hour training rain, ~6-7mm; NOT the fixed 10mm inherited from Seychelles which was too high for ERA5's smoothed hourly tail on Assam)
+2. **Quantile regression** (q10/q50/q90) — XGBoost, same features; adaptive per-district heavy-rain threshold (99.5th percentile of rainy-hour training rain, ~6-7mm).
 3. **CSG-Gamma + Local GPD tail reshape** — reshapes the heavy-event probability interval only; does not change q50
 4. **Pressure-grid CNN stacking** — CNN on the 5×5 ERA5 pressure-level grid, stacked onto the base via out-of-sample predictions; adopted as production because it replicates point-forecast corr_all gain across 46/48 (district × seed × lead) cells
 
@@ -127,7 +156,7 @@ Architecture (adapted from the Seychelles Phase 1 ensemble):
 - Sivasagar's stacking bias grows positive at h=4..h=6 and its h=4..h=6 RMSE gets worse with stacking — the only regression found; state this alongside Sivasagar's other flagged weaknesses in any writeup.
 - Heavy-interval coverage gain (CNN stacking) does NOT replicate across seeds (19/48 cells) and should not be cited.
 - The pressure-grid CNN physics term (moisture-flux convergence loss) is inert at current scale — call it "pressure-grid CNN," not PINN, in any writeup.
-- Regional GPD (the 3rd leg of the Seychelles ensemble) is not implemented — needs a regional surface-TP spatial grid, not yet pulled.
+- Regional GPD is not implemented — needs a regional surface-TP spatial grid, not yet pulled.
 - SLSQP blend (4th leg) was tried via the assembler and did not help.
 
 ---
@@ -187,9 +216,3 @@ Sivasagar 2026 is the weakest validation candidate on three independent grounds:
 
 HYSPLIT trajectories require HYSPLIT v5.4.2 installed separately (`hyts_std.exe`). The `pysplit` Python package was evaluated and rejected (unusable for this setup); scripts call `hyts_std.exe` directly.
 
----
-
-## Prior Phases
-
-- **Phase 1 — Sri Lanka** (`D:\BISAG-N\Sri_lanka`): methodology development and validation. GNN flood surrogate architecture and its documented bugs are in Sri Lanka's KNOWLEDGE_BASE.md. GNN zero-shot cross-basin transfer has failed twice on Sri Lankan basins — do not assume pre-trained weights transfer here.
-- **Phase 2 — Arunachal Pradesh** (`D:\BISAG-N\India\Arunachal_Pradesh`): transferability test. The data-availability audit for Assam was done during this phase (see Chroma `manual-0170` there). The Gumbel-IDF + Sherman + Alternating Block Method design-storm pipeline (`generate_design_storms.py`) is reusable.
